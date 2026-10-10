@@ -1,4 +1,5 @@
 import hashlib
+import html
 import json
 import os
 import sys
@@ -23,7 +24,11 @@ STATE_FILE = Path("state/seen.json")
 
 EMAIL = os.environ["PORTAL_EMAIL"].strip()
 PASSWORD = os.environ["PORTAL_PASSWORD"].strip()
-NTFY_TOPIC = os.environ["NTFY_TOPIC"].strip()
+TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+if not (TG_TOKEN and TG_CHAT):
+    print("ERROR: faltan los secrets TELEGRAM_TOKEN y/o TELEGRAM_CHAT_ID.")
+    sys.exit(1)
 
 
 def _lista(nombre, defecto=""):
@@ -80,9 +85,9 @@ def leer_tickets(page):
         prev = n
         time.sleep(1.5)
 
-    return page.eval_on_selector_all(
+    tickets = page.eval_on_selector_all(
         "tbody tr",
-        """rows => rows.map(tr => {
+        """rows => rows.map((tr, i) => {
             const td = tr.querySelectorAll('td');
             if (td.length < 4) return null;
             const t = td[0];
@@ -90,6 +95,7 @@ def leer_tickets(page):
                 .map(s => s.textContent.trim()).filter(Boolean);
             const ps = td[1].querySelectorAll('p');
             return {
+                fila:      i,
                 titulo:    (t.querySelector('p')?.textContent || '').trim(),
                 tipo:      meta[0] || '',
                 solicita:  meta[1] || '',
@@ -101,6 +107,31 @@ def leer_tickets(page):
             };
         }).filter(Boolean)""",
     )
+    return tickets
+
+
+def leer_detalle(page, t):
+    t.update(id="", creado=t["fecha"], descripcion="")
+    try:
+        page.locator("tbody tr").nth(t["fila"]).locator("td").first.click()
+        dialogo = page.locator("[role=dialog]").filter(has_text="Información del Ticket").first
+        dialogo.wait_for(state="visible", timeout=10000)
+
+        def campo(nombre):
+            loc = dialogo.locator("label", has_text=nombre).first.locator("xpath=following-sibling::*[1]")
+            return loc.inner_text(timeout=3000).strip() if loc.count() else ""
+
+        t["id"] = campo("ID")
+        t["creado"] = campo("Fecha de creación") or t["fecha"]
+        t["descripcion"] = campo("Descripción")
+    except Exception:
+        pass
+    finally:
+        page.keyboard.press("Escape")
+        try:
+            page.locator("[role=dialog]").first.wait_for(state="hidden", timeout=5000)
+        except PWTimeout:
+            pass
 
 
 def pasa_filtro(t):
@@ -120,35 +151,64 @@ def clave(t):
     return hashlib.sha256(base.encode()).hexdigest()
 
 
-# ---------------------------------------------------------------- aviso
+# ---------------------------------------------------------------- telegram
+def telegram(texto, silencioso):
+    r = requests.post(
+        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+        json={
+            "chat_id": TG_CHAT,
+            "text": texto,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            "disable_notification": silencioso,
+        },
+        timeout=20,
+    )
+    if not r.ok:
+        print(f"ERROR Telegram: {r.status_code} {r.json().get('description', '')}")
+        r.raise_for_status()
+
+
+def bloque(t, es_nuevo):
+    e = html.escape
+    desc = t.get("descripcion", "")
+    if len(desc) > 2500:
+        desc = desc[:2500] + "…"
+    marca = "🆕 " if es_nuevo else ""
+    lineas = [
+        f"{marca}<b>{e(t['titulo'])}</b>" + (f"  <code>#{e(t['id'])}</code>" if t.get("id") else ""),
+        f"📁 {e(t['proyecto'])}",
+        f"📌 {e(t['estado'])} · {e(t['prioridad'])} · {e(t['tipo'])}",
+        f"👤 {e(t['solicita'])} · 🕒 {e(t.get('creado') or t['fecha'])}",
+    ]
+    if desc:
+        lineas.append(f"\n{e(desc)}")
+    return "\n".join(lineas)
+
+
 def enviar_resumen(pendientes, nuevos_claves):
     alta = sum("alta" in t["prioridad"].lower() for t in pendientes)
     hay_nuevos = any(clave(t) in nuevos_claves for t in pendientes)
-
     pendientes = sorted(pendientes, key=lambda t: (clave(t) not in nuevos_claves,
                                                    "alta" not in t["prioridad"].lower()))
-    lineas = []
+
+    nombre = ", ".join(sorted({t["cliente"] or t["proyecto"] for t in pendientes}))
+    encabezado = f"<b>{html.escape(nombre)}: {len(pendientes)} pendientes ({alta} alta)</b>"
+    separador = "\n\n━━━━━━━━━━\n\n"
+
+    mensajes, actual = [], encabezado
     for t in pendientes:
-        marca = "[NUEVO] " if clave(t) in nuevos_claves else ""
-        lineas.append(f"• {marca}{t['titulo']} — {t['estado']} · {t['prioridad']} · {t['fecha']}")
+        b = bloque(t, clave(t) in nuevos_claves)
+        if len(actual) + len(separador) + len(b) > 4000:
+            mensajes.append(actual)
+            actual = b
+        else:
+            actual += separador + b
+    mensajes.append(actual)
 
-    mensaje = "\n".join(lineas)
-    if len(mensaje.encode()) > 3800:
-        mensaje = mensaje.encode()[:3800].decode(errors="ignore").rsplit("\n", 1)[0] + "\n… (ver portal)"
-
-    nombre = ", ".join(sorted({t["cliente"] or t["proyecto"] for t in pendientes})) or "Tickets"
-    requests.post(
-        "https://ntfy.sh/",
-        json={
-            "topic": NTFY_TOPIC,
-            "title": f"{nombre}: {len(pendientes)} pendientes ({alta} alta)",
-            "message": mensaje,
-            "priority": 5 if hay_nuevos else 3,
-            "tags": ["rotating_light"] if hay_nuevos else ["clipboard"],
-            "click": TICKETS_URL,
-        },
-        timeout=20,
-    ).raise_for_status()
+    for i, m in enumerate(mensajes):
+        telegram(m, silencioso=not (hay_nuevos and i == 0))
+        time.sleep(0.5)
 
 
 # ---------------------------------------------------------------- main
@@ -163,21 +223,25 @@ def main():
             print("ERROR: no se pudo iniciar sesión (revisa PORTAL_EMAIL / PORTAL_PASSWORD).")
             sys.exit(1)
         tickets = leer_tickets(page)
+        if not tickets:
+            print("ERROR: no se leyó ningún ticket (¿cambió la página?).")
+            sys.exit(1)
+
+        filtrados = [t for t in tickets if pasa_filtro(t)]
+        pendientes = [t for t in filtrados if pendiente(t)]
+        for t in pendientes:
+            leer_detalle(page, t)
         browser.close()
 
-    if not tickets:
-        print("ERROR: no se leyó ningún ticket (¿cambió la página?).")
-        sys.exit(1)
-
-    filtrados = [t for t in tickets if pasa_filtro(t)]
-    pendientes = [t for t in filtrados if pendiente(t)]
     nuevos_claves = set() if primera_vez else {clave(t) for t in filtrados} - vistos
 
     if pendientes:
         enviar_resumen(pendientes, nuevos_claves)
 
+    con_desc = sum(bool(t.get("descripcion")) for t in pendientes)
     print(f"Tickets leídos: {len(tickets)} · del filtro: {len(filtrados)} · "
-          f"pendientes enviados: {len(pendientes)} · nuevos: {len(nuevos_claves)}")
+          f"pendientes enviados: {len(pendientes)} (con descripción: {con_desc}) · "
+          f"nuevos: {len(nuevos_claves)}")
 
     vistos |= {clave(t) for t in filtrados}
     STATE_FILE.parent.mkdir(exist_ok=True)
