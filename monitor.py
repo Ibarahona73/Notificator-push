@@ -1,21 +1,3 @@
-"""
-Notificador de tickets: en cada ejecución manda UNA notificación al celular
-(vía ntfy) con la lista de todos los tickets pendientes que coinciden con el
-filtro, es decir, los que NO están en un estado excluido (por defecto
-"Solucionado"). Los tickets que no había visto antes se marcan como [NUEVO].
-
-Secrets en GitHub:
-  PORTAL_EMAIL       -> correo del portal                                (obligatorio)
-  PORTAL_PASSWORD    -> contraseña del portal                            (obligatorio)
-  PORTAL_URL         -> dirección del portal                             (obligatorio)
-  NTFY_TOPIC         -> nombre de tu tema en ntfy                        (obligatorio)
-  FILTRO             -> palabras a buscar en Proyecto o Cliente, separadas
-                        por coma. Vacío = todos los clientes             (opcional)
-  ESTADOS_EXCLUIDOS  -> estados que NO se muestran, separados por coma.
-                        Por defecto: Solucionado                         (opcional)
-
-Los registros (logs) solo muestran conteos: nunca títulos, nombres ni clientes.
-"""
 import hashlib
 import json
 import os
@@ -60,7 +42,6 @@ def login(page):
     email_in = form.locator("input[type=email]").first
     pass_in = form.locator("input:not([type=email]):not([type=hidden]):not([type=checkbox])").first
 
-    # Escribir como persona (algunos formularios React ignoran fill)
     email_in.click()
     email_in.press_sequentially(EMAIL, delay=30)
     pass_in.click()
@@ -77,7 +58,7 @@ def login(page):
     except PWTimeout:
         pass
 
-    pass_in.press("Enter")  # segundo intento
+    pass_in.press("Enter")
     try:
         page.wait_for_url(lambda u: "/login" not in u, timeout=15000)
         return True
@@ -91,7 +72,6 @@ def leer_tickets(page):
     page.goto(TICKETS_URL, wait_until="networkidle")
     page.wait_for_selector("tbody tr", timeout=60000)
 
-    # Esperar a que la tabla termine de cargar (el número de filas deja de cambiar)
     prev = -1
     for _ in range(10):
         n = page.locator("tbody tr").count()
@@ -145,7 +125,6 @@ def enviar_resumen(pendientes, nuevos_claves):
     alta = sum("alta" in t["prioridad"].lower() for t in pendientes)
     hay_nuevos = any(clave(t) in nuevos_claves for t in pendientes)
 
-    # Primero los nuevos, luego por prioridad Alta
     pendientes = sorted(pendientes, key=lambda t: (clave(t) not in nuevos_claves,
                                                    "alta" not in t["prioridad"].lower()))
     lineas = []
@@ -154,7 +133,7 @@ def enviar_resumen(pendientes, nuevos_claves):
         lineas.append(f"• {marca}{t['titulo']} — {t['estado']} · {t['prioridad']} · {t['fecha']}")
 
     mensaje = "\n".join(lineas)
-    if len(mensaje.encode()) > 3800:  # límite de ntfy ~4 KB
+    if len(mensaje.encode()) > 3800:
         mensaje = mensaje.encode()[:3800].decode(errors="ignore").rsplit("\n", 1)[0] + "\n… (ver portal)"
 
     nombre = ", ".join(sorted({t["cliente"] or t["proyecto"] for t in pendientes})) or "Tickets"
@@ -192,7 +171,6 @@ def main():
 
     filtrados = [t for t in tickets if pasa_filtro(t)]
     pendientes = [t for t in filtrados if pendiente(t)]
-    # En la primera ejecución nada se marca como NUEVO
     nuevos_claves = set() if primera_vez else {clave(t) for t in filtrados} - vistos
 
     if pendientes:
