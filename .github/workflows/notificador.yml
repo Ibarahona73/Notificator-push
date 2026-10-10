@@ -1,0 +1,51 @@
+name: Notificador de tickets
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"   # cada 20 minutos (GitHub puede retrasarlo unos minutos)
+  workflow_dispatch:          # botón para correrlo a mano
+
+concurrency:
+  group: notificador
+  cancel-in-progress: false # cancelar el job en progreso si se ejecuta otro
+
+jobs:
+  revisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # tiempo de espera para la ejecución del job
+    steps:
+      - uses: actions/checkout@v4 # checkout del repositorio
+
+      - uses: actions/setup-python@v5 # setup de python
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      # Recupera la lista de tickets ya vistos de la ejecución anterior
+      - name: Restaurar estado
+        uses: actions/cache/restore@v4 
+        with:
+          path: state
+          key: tickets-state-${{ github.run_id }}
+          restore-keys: tickets-state-
+
+      - name: Revisar portal # revisa el portal y manda una notificación al celular
+        env:
+          PORTAL_EMAIL: ${{ secrets.PORTAL_EMAIL }} # correo del portal
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }} # contraseña del portal
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }} # nombre de tu tema en ntfy
+          FILTRO: ${{ secrets.FILTRO }} # palabras a buscar en Proyecto o Cliente, separadas por coma. Vacío = TODOS los tickets (opcional)
+          PORTAL_URL: ${{ secrets.PORTAL_URL }} # dirección del portal
+        run: python monitor.py
+
+      - name: Guardar estado 
+        if: success() 
+        uses: actions/cache/save@v4 
+        with:
+          path: state
+          key: tickets-state-${{ github.run_id }}
