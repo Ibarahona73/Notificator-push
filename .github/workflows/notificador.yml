@@ -2,7 +2,7 @@ name: Notificador de tickets
 
 on:
   schedule:
-    - cron: "*/20 * * * *"   # cada 20 minutos (GitHub puede retrasarlo unos minutos)
+    - cron: "*/10 * * * *"   # cada 10 minutos (GitHub puede retrasarlo unos minutos)
   workflow_dispatch:          # botón para correrlo a mano
 
 concurrency:

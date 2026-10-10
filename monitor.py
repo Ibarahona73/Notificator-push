@@ -1,14 +1,18 @@
 """
-Notificador de tickets: revisa el portal y manda una notificación al celular
-(vía ntfy) cuando aparece un ticket nuevo que coincide con el filtro.
+Notificador de tickets: en cada ejecución manda UNA notificación al celular
+(vía ntfy) con la lista de todos los tickets pendientes que coinciden con el
+filtro, es decir, los que NO están en un estado excluido (por defecto
+"Solucionado"). Los tickets que no había visto antes se marcan como [NUEVO].
 
-Todo lo sensible se configura como Secrets en GitHub, nada queda en el código:
-  PORTAL_EMAIL      -> correo del portal                          (obligatorio)
-  PORTAL_PASSWORD   -> contraseña del portal                      (obligatorio)
-  NTFY_TOPIC        -> nombre de tu tema en ntfy                  (obligatorio)
-  FILTRO            -> palabras a buscar en Proyecto o Cliente,
-                       separadas por coma. Vacío = TODOS los tickets (opcional)
-  PORTAL_URL        -> dirección del portal                       (obligatorio)
+Secrets en GitHub:
+  PORTAL_EMAIL       -> correo del portal                                (obligatorio)
+  PORTAL_PASSWORD    -> contraseña del portal                            (obligatorio)
+  PORTAL_URL         -> dirección del portal                             (obligatorio)
+  NTFY_TOPIC         -> nombre de tu tema en ntfy                        (obligatorio)
+  FILTRO             -> palabras a buscar en Proyecto o Cliente, separadas
+                        por coma. Vacío = todos los clientes             (opcional)
+  ESTADOS_EXCLUIDOS  -> estados que NO se muestran, separados por coma.
+                        Por defecto: Solucionado                         (opcional)
 
 Los registros (logs) solo muestran conteos: nunca títulos, nombres ni clientes.
 """
@@ -23,7 +27,7 @@ from urllib.parse import urlparse
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# Toma solo el dominio del secret PORTAL_URL (aunque traiga una ruta).
+# ---------------------------------------------------------------- configuración
 _url = os.environ.get("PORTAL_URL", "").strip()
 if _url and "://" not in _url:
     _url = "https://" + _url
@@ -35,59 +39,50 @@ BASE = f"{_p.scheme}://{_p.netloc}"
 TICKETS_URL = f"{BASE}/tickets/all-tickets"
 STATE_FILE = Path("state/seen.json")
 
-EMAIL = os.environ["PORTAL_EMAIL"]
-PASSWORD = os.environ["PORTAL_PASSWORD"]
-NTFY_TOPIC = os.environ["NTFY_TOPIC"]
-FILTRO = [f.strip().lower() for f in os.environ.get("FILTRO", "").split(",") if f.strip()]
+EMAIL = os.environ["PORTAL_EMAIL"].strip()
+PASSWORD = os.environ["PORTAL_PASSWORD"].strip()
+NTFY_TOPIC = os.environ["NTFY_TOPIC"].strip()
+
+
+def _lista(nombre, defecto=""):
+    valor = os.environ.get(nombre) or defecto
+    return [x.strip().lower() for x in valor.split(",") if x.strip()]
+
+
+FILTRO = _lista("FILTRO")
+EXCLUIDOS = _lista("ESTADOS_EXCLUIDOS", "Solucionado")
 
 
 # ---------------------------------------------------------------- login
 def login(page):
-    # Diagnóstico sin revelar datos: solo largos y si tienen espacios de más
-    print(f"[diag] email: {len(EMAIL)} caracteres, espacios extra: {EMAIL != EMAIL.strip()}")
-    print(f"[diag] password: {len(PASSWORD)} caracteres, espacios extra: {PASSWORD != PASSWORD.strip()}")
-
     page.goto(f"{BASE}/login", wait_until="networkidle")
     form = page.locator("form").first
     email_in = form.locator("input[type=email]").first
     pass_in = form.locator("input:not([type=email]):not([type=hidden]):not([type=checkbox])").first
-    print(f"[diag] campos encontrados: email={email_in.count()} clave={pass_in.count()}")
 
     # Escribir como persona (algunos formularios React ignoran fill)
     email_in.click()
-    email_in.press_sequentially(EMAIL.strip(), delay=30)
+    email_in.press_sequentially(EMAIL, delay=30)
     pass_in.click()
-    pass_in.press_sequentially(PASSWORD.strip(), delay=30)
-    print(f"[diag] largo escrito: email={len(email_in.input_value())} clave={len(pass_in.input_value())}")
+    pass_in.press_sequentially(PASSWORD, delay=30)
 
-    # Registrar las respuestas del servidor de autenticación (solo ruta y código)
     respuestas = []
-    page.on("response", lambda r: respuestas.append(f"{r.request.method} {urlparse(r.url).path} -> {r.status}")
+    page.on("response", lambda r: respuestas.append(f"{urlparse(r.url).path} -> {r.status}")
             if "/api/auth" in r.url else None)
 
-    captcha = page.locator("iframe[src*='turnstile'], iframe[src*='recaptcha'], iframe[src*='hcaptcha'], .cf-turnstile").count()
-    print(f"[diag] captcha detectado: {captcha > 0}")
-
-    boton = form.get_by_role("button", name="Iniciar sesión")
-    print(f"[diag] botón habilitado: {boton.is_enabled()}")
-    boton.click()
+    form.get_by_role("button", name="Iniciar sesión").click()
     try:
         page.wait_for_url(lambda u: "/login" not in u, timeout=20000)
         return True
     except PWTimeout:
         pass
 
-    # Segundo intento: enviar con Enter
-    pass_in.press("Enter")
+    pass_in.press("Enter")  # segundo intento
     try:
         page.wait_for_url(lambda u: "/login" not in u, timeout=15000)
         return True
     except PWTimeout:
-        msgs = page.locator("[role=alert], [data-sonner-toast], p.text-red-500, p.text-red-600, .text-destructive").all_inner_texts()
-        print(f"[diag] sigue en: {urlparse(page.url).path}")
-        print(f"[diag] respuestas auth: {respuestas[-6:]}")
-        print(f"[diag] mensajes en pantalla: {[m.strip()[:120] for m in msgs if m.strip()][:3]}")
-        print(f"[diag] cookies de sesión: {[c['name'] for c in page.context.cookies() if 'session' in c['name'].lower()]}")
+        print(f"[diag] respuestas auth: {respuestas[-4:]}  (401 = correo o contraseña incorrectos)")
         return False
 
 
@@ -135,22 +130,42 @@ def pasa_filtro(t):
     return any(f in texto for f in FILTRO)
 
 
+def pendiente(t):
+    estado = t["estado"].lower()
+    return not any(e in estado for e in EXCLUIDOS)
+
+
 def clave(t):
     base = "|".join([t["titulo"], t["tipo"], t["solicita"], t["fecha"], t["proyecto"], t["cliente"]])
     return hashlib.sha256(base.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------- aviso
-def notificar(t):
+def enviar_resumen(pendientes, nuevos_claves):
+    alta = sum("alta" in t["prioridad"].lower() for t in pendientes)
+    hay_nuevos = any(clave(t) in nuevos_claves for t in pendientes)
+
+    # Primero los nuevos, luego por prioridad Alta
+    pendientes = sorted(pendientes, key=lambda t: (clave(t) not in nuevos_claves,
+                                                   "alta" not in t["prioridad"].lower()))
+    lineas = []
+    for t in pendientes:
+        marca = "[NUEVO] " if clave(t) in nuevos_claves else ""
+        lineas.append(f"• {marca}{t['titulo']} — {t['estado']} · {t['prioridad']} · {t['fecha']}")
+
+    mensaje = "\n".join(lineas)
+    if len(mensaje.encode()) > 3800:  # límite de ntfy ~4 KB
+        mensaje = mensaje.encode()[:3800].decode(errors="ignore").rsplit("\n", 1)[0] + "\n… (ver portal)"
+
+    nombre = ", ".join(sorted({t["cliente"] or t["proyecto"] for t in pendientes})) or "Tickets"
     requests.post(
         "https://ntfy.sh/",
         json={
             "topic": NTFY_TOPIC,
-            "title": f"Nuevo ticket: {t['cliente'] or t['proyecto']}",
-            "message": f"{t['titulo']}\n{t['proyecto']}\n{t['tipo']} · {t['solicita']} · {t['fecha']}\n"
-                       f"Prioridad: {t['prioridad']} · Estado: {t['estado']}",
-            "priority": 5 if "alta" in t["prioridad"].lower() else 4,
-            "tags": ["ticket"],
+            "title": f"{nombre}: {len(pendientes)} pendientes ({alta} alta)",
+            "message": mensaje,
+            "priority": 5 if hay_nuevos else 3,
+            "tags": ["rotating_light"] if hay_nuevos else ["clipboard"],
             "click": TICKETS_URL,
         },
         timeout=20,
@@ -176,15 +191,15 @@ def main():
         sys.exit(1)
 
     filtrados = [t for t in tickets if pasa_filtro(t)]
-    nuevos = [t for t in filtrados if clave(t) not in vistos]
+    pendientes = [t for t in filtrados if pendiente(t)]
+    # En la primera ejecución nada se marca como NUEVO
+    nuevos_claves = set() if primera_vez else {clave(t) for t in filtrados} - vistos
 
-    if primera_vez:
-        print(f"Primera ejecución: se guardan {len(filtrados)} tickets existentes sin notificar.")
-    else:
-        for t in nuevos:
-            notificar(t)
-        print(f"Tickets leídos: {len(tickets)} · coinciden con el filtro: {len(filtrados)} · "
-              f"nuevos notificados: {len(nuevos)}")
+    if pendientes:
+        enviar_resumen(pendientes, nuevos_claves)
+
+    print(f"Tickets leídos: {len(tickets)} · del filtro: {len(filtrados)} · "
+          f"pendientes enviados: {len(pendientes)} · nuevos: {len(nuevos_claves)}")
 
     vistos |= {clave(t) for t in filtrados}
     STATE_FILE.parent.mkdir(exist_ok=True)
