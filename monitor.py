@@ -8,7 +8,7 @@ Todo lo sensible se configura como Secrets en GitHub, nada queda en el código:
   NTFY_TOPIC        -> nombre de tu tema en ntfy                  (obligatorio)
   FILTRO            -> palabras a buscar en Proyecto o Cliente,
                        separadas por coma. Vacío = TODOS los tickets (opcional)
-  PORTAL_URL        -> dirección del portal                       (opcional)
+  PORTAL_URL        -> dirección del portal                       (obligatorio)
 
 Los registros (logs) solo muestran conteos: nunca títulos, nombres ni clientes.
 """
@@ -23,10 +23,14 @@ from urllib.parse import urlparse
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# Toma solo el dominio del secret PORTAL_URL (aunque traiga una ruta);
-# si está vacío usa la dirección por defecto.
-_url = os.environ.get("PORTAL_URL")
+# Toma solo el dominio del secret PORTAL_URL (aunque traiga una ruta).
+_url = os.environ.get("PORTAL_URL", "").strip()
+if _url and "://" not in _url:
+    _url = "https://" + _url
 _p = urlparse(_url)
+if not _p.netloc:
+    print("ERROR: falta el secret PORTAL_URL (ej. https://tu-portal.com).")
+    sys.exit(1)
 BASE = f"{_p.scheme}://{_p.netloc}"
 TICKETS_URL = f"{BASE}/tickets/all-tickets"
 STATE_FILE = Path("state/seen.json")
@@ -39,16 +43,32 @@ FILTRO = [f.strip().lower() for f in os.environ.get("FILTRO", "").split(",") if 
 
 # ---------------------------------------------------------------- login
 def login(page):
+    # Diagnóstico sin revelar datos: solo largos y si tienen espacios de más
+    print(f"[diag] email: {len(EMAIL)} caracteres, espacios extra: {EMAIL != EMAIL.strip()}")
+    print(f"[diag] password: {len(PASSWORD)} caracteres, espacios extra: {PASSWORD != PASSWORD.strip()}")
+
     page.goto(f"{BASE}/login", wait_until="networkidle")
     form = page.locator("form").first
-    form.locator("input[type=email]").first.fill(EMAIL)
-    # el campo de contraseña es el que sigue al correo (puede no ser type=password)
-    form.locator("input:not([type=email]):not([type=hidden]):not([type=checkbox])").first.fill(PASSWORD)
+    email_in = form.locator("input[type=email]").first
+    pass_in = form.locator("input:not([type=email]):not([type=hidden]):not([type=checkbox])").first
+    print(f"[diag] campos encontrados: email={email_in.count()} password={pass_in.count()}")
+
+    # Escribir como persona (algunos formularios React ignoran fill)
+    email_in.click()
+    email_in.press_sequentially(EMAIL.strip(), delay=30)
+    pass_in.click()
+    pass_in.press_sequentially(PASSWORD.strip(), delay=30)
+    print(f"[diag] largo escrito: email={len(email_in.input_value())} password={len(pass_in.input_value())}")
+
     form.get_by_role("button", name="Iniciar sesión").click()
     try:
         page.wait_for_url(lambda u: "/login" not in u, timeout=30000)
         return True
     except PWTimeout:
+        # Mostrar el mensaje de error del portal (no contiene datos sensibles)
+        msgs = page.locator("[role=alert], .text-red-500, .text-red-600, [data-sonner-toast]").all_inner_texts()
+        print(f"[diag] sigue en: {urlparse(page.url).path}")
+        print(f"[diag] mensajes en pantalla: {[m.strip() for m in msgs if m.strip()][:3]}")
         return False
 
 
