@@ -51,24 +51,43 @@ def login(page):
     form = page.locator("form").first
     email_in = form.locator("input[type=email]").first
     pass_in = form.locator("input:not([type=email]):not([type=hidden]):not([type=checkbox])").first
-    print(f"[diag] campos encontrados: email={email_in.count()} password={pass_in.count()}")
+    print(f"[diag] campos encontrados: email={email_in.count()} clave={pass_in.count()}")
 
     # Escribir como persona (algunos formularios React ignoran fill)
     email_in.click()
     email_in.press_sequentially(EMAIL.strip(), delay=30)
     pass_in.click()
     pass_in.press_sequentially(PASSWORD.strip(), delay=30)
-    print(f"[diag] largo escrito: email={len(email_in.input_value())} password={len(pass_in.input_value())}")
+    print(f"[diag] largo escrito: email={len(email_in.input_value())} clave={len(pass_in.input_value())}")
 
-    form.get_by_role("button", name="Iniciar sesión").click()
+    # Registrar las respuestas del servidor de autenticación (solo ruta y código)
+    respuestas = []
+    page.on("response", lambda r: respuestas.append(f"{r.request.method} {urlparse(r.url).path} -> {r.status}")
+            if "/api/auth" in r.url else None)
+
+    captcha = page.locator("iframe[src*='turnstile'], iframe[src*='recaptcha'], iframe[src*='hcaptcha'], .cf-turnstile").count()
+    print(f"[diag] captcha detectado: {captcha > 0}")
+
+    boton = form.get_by_role("button", name="Iniciar sesión")
+    print(f"[diag] botón habilitado: {boton.is_enabled()}")
+    boton.click()
     try:
-        page.wait_for_url(lambda u: "/login" not in u, timeout=30000)
+        page.wait_for_url(lambda u: "/login" not in u, timeout=20000)
         return True
     except PWTimeout:
-        # Mostrar el mensaje de error del portal (no contiene datos sensibles)
-        msgs = page.locator("[role=alert], .text-red-500, .text-red-600, [data-sonner-toast]").all_inner_texts()
+        pass
+
+    # Segundo intento: enviar con Enter
+    pass_in.press("Enter")
+    try:
+        page.wait_for_url(lambda u: "/login" not in u, timeout=15000)
+        return True
+    except PWTimeout:
+        msgs = page.locator("[role=alert], [data-sonner-toast], p.text-red-500, p.text-red-600, .text-destructive").all_inner_texts()
         print(f"[diag] sigue en: {urlparse(page.url).path}")
-        print(f"[diag] mensajes en pantalla: {[m.strip() for m in msgs if m.strip()][:3]}")
+        print(f"[diag] respuestas auth: {respuestas[-6:]}")
+        print(f"[diag] mensajes en pantalla: {[m.strip()[:120] for m in msgs if m.strip()][:3]}")
+        print(f"[diag] cookies de sesión: {[c['name'] for c in page.context.cookies() if 'session' in c['name'].lower()]}")
         return False
 
 
