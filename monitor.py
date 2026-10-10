@@ -8,7 +8,7 @@ Todo lo sensible se configura como Secrets en GitHub, nada queda en el código:
   NTFY_TOPIC        -> nombre de tu tema en ntfy                  (obligatorio)
   FILTRO            -> palabras a buscar en Proyecto o Cliente,
                        separadas por coma. Vacío = TODOS los tickets (opcional)
-  PORTAL_URL        -> dirección del portal                       (obligatorio)
+  PORTAL_URL        -> dirección del portal                       (opcional)
 
 Los registros (logs) solo muestran conteos: nunca títulos, nombres ni clientes.
 """
@@ -18,11 +18,16 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-BASE = os.environ.get("PORTAL_URL").rstrip("/")
+# Toma solo el dominio del secret PORTAL_URL (aunque traiga una ruta);
+# si está vacío usa la dirección por defecto.
+_url = os.environ.get("PORTAL_URL")
+_p = urlparse(_url)
+BASE = f"{_p.scheme}://{_p.netloc}"
 TICKETS_URL = f"{BASE}/tickets/all-tickets"
 STATE_FILE = Path("state/seen.json")
 
